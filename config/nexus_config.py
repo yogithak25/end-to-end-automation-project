@@ -2,6 +2,9 @@ import time
 import requests
 import docker
 from config.env_loader import get_env
+import base64
+import xml.etree.ElementTree as ET
+
 
 config = get_env()
 BASE_URL = config["NEXUS_URL"]
@@ -9,7 +12,7 @@ CONTAINER_NAME = "nexus"
 
 
 # -----------------------------
-# ENV UPDATE 
+# ENV UPDATE
 # -----------------------------
 def update_env(key, value, file_path="env.txt"):
     lines = []
@@ -260,6 +263,172 @@ def create_maven_repo():
 
     return repo_name
 
+# -----------------------------
+# UPDATE GITHUB pom.xml
+# -----------------------------
+def update_pom_xml(repo_url):
+
+    print("\n📝 Updating GitHub pom.xml...\n")
+
+    github_user = config["GITHUB_USER"]
+    github_token = config["GITHUB_TOKEN"]
+
+    owner = "yogithak25"
+    repo = "end-to-end-devops-project"
+
+    file_path = "pom.xml"
+
+    api_url = (
+        f"https://api.github.com/repos/"
+        f"{owner}/{repo}/contents/{file_path}"
+    )
+
+    headers = {
+        "Accept": "application/vnd.github+json"
+    }
+
+    # -----------------------------
+    # FETCH EXISTING pom.xml
+    # -----------------------------
+    r = safe_request(
+        "GET",
+        api_url,
+        headers=headers,
+        auth=(github_user, github_token)
+    )
+
+    if r.status_code != 200:
+        raise Exception(f"❌ Failed fetching pom.xml: {r.text}")
+
+    data = r.json()
+
+    sha = data["sha"]
+
+    # decode file content
+    content = base64.b64decode(
+        data["content"]
+    ).decode()
+
+    # -----------------------------
+    # PARSE XML
+    # -----------------------------
+    root = ET.fromstring(content)
+
+    ns = {
+        "m": "http://maven.apache.org/POM/4.0.0"
+    }
+
+    distribution = root.find("m:distributionManagement", ns)
+
+    # -----------------------------
+    # CREATE distributionManagement
+    # -----------------------------
+    if distribution is None:
+
+        distribution = ET.SubElement(
+            root,
+            "{http://maven.apache.org/POM/4.0.0}distributionManagement"
+        )
+
+    # -----------------------------
+    # CREATE repository
+    # -----------------------------
+    repository = distribution.find("m:repository", ns)
+
+    if repository is None:
+
+        repository = ET.SubElement(
+            distribution,
+            "{http://maven.apache.org/POM/4.0.0}repository"
+        )
+
+    # -----------------------------
+    # CREATE id
+    # -----------------------------
+    repo_id = repository.find("m:id", ns)
+
+    if repo_id is None:
+
+        repo_id = ET.SubElement(
+            repository,
+            "{http://maven.apache.org/POM/4.0.0}id"
+        )
+
+    repo_id.text = "nexus"
+
+    # -----------------------------
+    # CREATE url
+    # -----------------------------
+    url_element = repository.find("m:url", ns)
+
+    if url_element is None:
+
+        url_element = ET.SubElement(
+            repository,
+            "{http://maven.apache.org/POM/4.0.0}url"
+        )
+
+    current_url = (url_element.text or "").strip()
+
+    # -----------------------------
+    # IDEMPOTENT CHECK
+    # -----------------------------
+    if current_url == repo_url:
+
+        print("✅ pom.xml already contains correct Nexus URL")
+        return
+
+    print(f"🔄 Updating Nexus URL")
+    print(f"Old: {current_url}")
+    print(f"New: {repo_url}")
+
+    url_element.text = repo_url
+
+    # -----------------------------
+    # XML → STRING
+    # -----------------------------
+    # preserve original namespaces
+    ET.register_namespace(
+        "",
+        "http://maven.apache.org/POM/4.0.0"
+    )
+
+    ET.register_namespace(
+        "xsi",
+        "http://www.w3.org/2001/XMLSchema-instance"
+    )
+
+    updated_xml = ET.tostring(
+        root,
+        encoding="unicode"
+    )
+    # encode to base64
+    encoded_content = base64.b64encode(
+        updated_xml.encode()
+    ).decode()
+
+    payload = {
+        "message": "update pom.xml",
+        "content": encoded_content,
+        "sha": sha
+    }
+
+    # -----------------------------
+    # UPDATE FILE IN GITHUB
+    # -----------------------------
+    r = safe_request(
+        "PUT",
+        api_url,
+        headers=headers,
+        auth=(github_user, github_token),
+        json=payload
+    )
+
+    if r.status_code not in [200, 201]:
+        raise Exception(f"❌ Failed updating pom.xml: {r.text}")
+
+    print("✅ pom.xml updated directly in GitHub")
+
 
 # -----------------------------
 # MAIN
@@ -272,5 +441,13 @@ def setup_nexus():
 
     repo = create_maven_repo()
 
+
+    repo_url = f"{BASE_URL}/repository/{repo}/"
+
+    # UPDATE pom.xml IN GITHUB
+    update_pom_xml(repo_url)
+
     print("\n✅ NEXUS CONFIG COMPLETED\n")
-    return f"{BASE_URL}/repository/{repo}/"
+
+    return repo_url
+

@@ -301,7 +301,8 @@ def generate_token():
 # INSTALL PLUGINS
 # -----------------------------
 def install_plugins():
-    print("\n📦 Installing plugins...\n")
+
+    print("\n📦 Ensuring Jenkins plugins...\n")
 
     plugins = [
         "workflow-aggregator",
@@ -316,105 +317,197 @@ def install_plugins():
         "pipeline-maven"
     ]
 
-    env = get_env()
-    user = env["JENKINS_USER"]
-    password = env["JENKINS_PASSWORD"]
+    user = config["JENKINS_USER"]
+    password = config["JENKINS_PASSWORD"]
 
     session = requests.Session()
     session.auth = (user, password)
 
     # -----------------------------
-    # STEP 1: TRY FETCH INSTALLED
+    # WAIT FOR PLUGIN MANAGER
     # -----------------------------
-    print("⏳ Checking installed plugins...")
+    print("⏳ Waiting for Jenkins Plugin Manager...\n")
 
-    installed = None
+    installed = []
 
-    for i in range(20):
+    for i in range(60):
+
+        print(f"Waiting Plugin Manager... ({i+1}/60)")
+
         try:
+
             r = session.get(
                 f"{BASE_URL}/pluginManager/api/json?depth=1",
-                timeout=5
+                timeout=10
             )
 
-            if r.status_code == 200 and "application/json" in r.headers.get("Content-Type", ""):
-                data = r.json()
-                installed = [p["shortName"] for p in data.get("plugins", [])]
+            # Jenkins still initializing
+            if r.status_code != 200:
+                time.sleep(5)
+                continue
+
+            # sometimes Jenkins returns HTML while loading
+            if "application/json" not in r.headers.get("Content-Type", ""):
+                time.sleep(5)
+                continue
+
+            data = r.json()
+
+            # plugin manager loaded
+            if data.get("plugins") is not None:
+
+                installed = [
+                    p["shortName"]
+                    for p in data.get("plugins", [])
+                ]
+
                 break
+
         except:
             pass
 
-        time.sleep(3)
+        time.sleep(5)
 
     # -----------------------------
-    # STEP 2: HANDLE FIRST RUN
+    # VALIDATE
     # -----------------------------
     if installed is None:
-        print("⚠️ Plugin API not ready → assuming fresh setup")
-        missing = plugins
-    else:
-        print(f"✅ Installed plugins: {len(installed)}")
-        missing = [p for p in plugins if p not in installed]
+        raise Exception("❌ Jenkins Plugin Manager not ready")
 
-    if not missing:
-        print("✅ All plugins already installed. Skipping.")
-        return
-
-    print(f"⬇️ Installing plugins: {missing}")
+    print(f"\n✅ Installed plugins found: {len(installed)}")
 
     # -----------------------------
-    # STEP 3: GET CRUMB
+    # FIND MISSING PLUGINS
+    # -----------------------------
+    missing = [
+        p for p in plugins
+        if p not in installed
+    ]
+
+    if not missing:
+        print("✅ All plugins already installed")
+        return
+
+    print(f"\n⬇️ Missing plugins: {missing}\n")
+
+    # -----------------------------
+    # GET CRUMB
     # -----------------------------
     crumb = None
 
-    for i in range(20):
-        try:
-            r = session.get(f"{BASE_URL}/crumbIssuer/api/json", timeout=5)
+    for i in range(30):
 
-            if r.status_code == 200 and "application/json" in r.headers.get("Content-Type", ""):
+        try:
+
+            r = session.get(
+                f"{BASE_URL}/crumbIssuer/api/json",
+                timeout=10
+            )
+
+            if (
+                r.status_code == 200 and
+                "application/json" in r.headers.get("Content-Type", "")
+            ):
                 crumb = r.json()
                 break
+
         except:
             pass
 
-        time.sleep(2)
+        print(f"Waiting Crumb... ({i+1}/30)")
+        time.sleep(3)
 
     if not crumb:
-        raise Exception("❌ Failed to get crumb")
+        raise Exception("❌ Failed to get Jenkins crumb")
 
     session.headers.update({
         crumb["crumbRequestField"]: crumb["crumb"]
     })
 
-    # -----------------------------
-    # STEP 4: INSTALL
-    # -----------------------------
-    xml = "<jenkins>" + "".join(
-        [f'<install plugin="{p}@latest"/>' for p in missing]
-    ) + "</jenkins>"
-
-    r = session.post(
-        f"{BASE_URL}/pluginManager/installNecessaryPlugins",
-        headers={"Content-Type": "text/xml"},
-        data=xml
-    )
-
-    if r.status_code not in [200, 201, 202]:
-        raise Exception(f"❌ Plugin install failed: {r.text}")
-
-    print("⏳ Installing plugins...")
-    time.sleep(240)
+    restart_required = False
 
     # -----------------------------
-    # STEP 5: RESTART
+    # INSTALL MISSING PLUGINS
     # -----------------------------
-    print("🔄 Restarting Jenkins...")
+    for plugin in missing:
 
-    client.containers.get(CONTAINER_NAME).restart()
-    wait_for_jenkins()
+        print(f"\n⬇️ Installing plugin: {plugin}")
 
-    print("✅ Plugins installed successfully")
+        xml = f"""
+<jenkins>
+  <install plugin="{plugin}@latest" />
+</jenkins>
+"""
 
+        r = session.post(
+            f"{BASE_URL}/pluginManager/installNecessaryPlugins",
+            headers={"Content-Type": "text/xml"},
+            data=xml
+        )
+
+        if r.status_code not in [200, 201, 202]:
+            raise Exception(f"❌ Failed installing {plugin}")
+
+        installed_ok = False
+
+        # -----------------------------
+        # WAIT FOR INSTALLATION
+        # -----------------------------
+        for i in range(60):
+
+            try:
+
+                rr = session.get(
+                    f"{BASE_URL}/pluginManager/api/json?depth=1",
+                    timeout=10
+                )
+
+                if rr.status_code != 200:
+                    time.sleep(5)
+                    continue
+
+                if "application/json" not in rr.headers.get("Content-Type", ""):
+                    time.sleep(5)
+                    continue
+
+                data = rr.json()
+
+                current_plugins = [
+                    p["shortName"]
+                    for p in data.get("plugins", [])
+                ]
+
+                if plugin in current_plugins:
+
+                    print(f"✅ Installed: {plugin}")
+
+                    installed_ok = True
+                    restart_required = True
+                    break
+
+            except:
+                pass
+
+            print(f"Installing {plugin}... ({i+1}/60)")
+            time.sleep(5)
+
+        if not installed_ok:
+            raise Exception(f"❌ Timeout installing: {plugin}")
+
+    # -----------------------------
+    # RESTART ONLY IF REQUIRED
+    # -----------------------------
+    if restart_required:
+
+        print("\n🔄 Restarting Jenkins...\n")
+
+        client.containers.get(CONTAINER_NAME).restart()
+
+        wait_for_jenkins()
+
+        print("✅ Jenkins restarted")
+
+    print("\n✅ Plugin setup completed\n")
 
 # -----------------------------
 # ADD CREDENTIALS
@@ -877,3 +970,4 @@ def setup_jenkins():
     configure_nexus_settings()
 
     print("\n✅ JENKINS FULLY CONFIGURED\n")
+
