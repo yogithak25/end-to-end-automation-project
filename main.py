@@ -72,6 +72,19 @@ def main():
 
     print("\n✅ PHASE 4 COMPLETED (ARGOCD READY)\n")
 
+    # =====================================================
+    # 🔹 PHASE 5: AUTOSCALING
+    # =====================================================
+
+    print("\n🚀 PHASE 5: AUTOSCALING SETUP\n")
+
+    from installer.autoscaling import setup_autoscaling
+
+    setup_autoscaling()
+
+    print("\n✅ PHASE 5 COMPLETED (AUTOSCALING READY)\n")
+
+
     print("\n🎉 FULL END-TO-END DEVOPS AUTOMATION COMPLETED SUCCESSFULLY!\n")
 
 
